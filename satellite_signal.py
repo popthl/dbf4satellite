@@ -13,12 +13,13 @@ class SatelliteSignal:
         bandwidth: 信号带宽（Hz）
         sampling_rate: 采样率（Hz）
     """
-    def __init__(self, frequency=1e9, bandwidth=10e6, sampling_rate=20e6):
+    def __init__(self, frequency=1e9, freqlocal=0.9e9,bandwidth=10e6, sampling_rate=20e6):
         self.frequency = frequency
+        self.freqlocal = freqlocal
         self.bandwidth = bandwidth
         self.sampling_rate = sampling_rate
         
-    def generate_signal(self, duration, snr_db=20, doppler_shift=0, modulation_type='sinusoid'):
+    def generate_signal(self, duration, snr_db=20, doppler_shift=0, modulation_type='single_carrier'):
         """
         生成卫星信号，支持多普勒频移和多种调制方式
         
@@ -26,22 +27,28 @@ class SatelliteSignal:
             duration: 信号持续时间（秒）
             snr_db: 信噪比（dB）
             doppler_shift: 多普勒频移（Hz）
-            modulation_type: 调制类型，可选值：'sinusoid'（正弦波）、'qpsk'（QPSK调制）、'bpsk'（BPSK调制）
+            modulation_type: 调制类型，可选值：'single_carrier'(单载波), 'sinusoid'（正弦波）、'qpsk'（QPSK调制）、'bpsk'（BPSK调制）
         
         返回:
             生成的信号，形状为(N,)
+            注意：返回的是基带信号（已下变频到0频附近），采样频率为self.sampling_rate
         """
         # 生成时间序列
         t = np.arange(0, duration, 1/self.sampling_rate)
         N = len(t)
-        
+
         # 生成载波信号
-        carrier = np.cos(2 * np.pi * (self.frequency + doppler_shift) * t)
-        
+        carrier = np.cos(2 * np.pi * (self.frequency - self.freqlocal + doppler_shift) * t)
+        print(modulation_type, doppler_shift,self.frequency, self.freqlocal,self.frequency - self.freqlocal + doppler_shift)
         # 生成有意义的基带信号
-        if modulation_type == 'sinusoid':
+        if modulation_type == 'single_carrier':
+            # 单载波信号（简单且容易观察）
+            baseband = 1
+        
+        elif modulation_type == 'sinusoid':
             # 正弦波基带信号（简单且容易观察）
-            baseband_freq = 100000  # 基带频率100kHz
+            # 包含多普勒频移信息
+            baseband_freq = doppler_shift  # 基带频率等于多普勒频移
             baseband = np.cos(2 * np.pi * baseband_freq * t)
         
         elif modulation_type == 'bpsk':
@@ -93,6 +100,10 @@ class SatelliteSignal:
                 end_idx = start_idx + len(pulse)
                 if end_idx <= N:
                     baseband[start_idx:end_idx] += symbols[i] * pulse
+            
+            # 添加多普勒频移（通过频率偏移实现）
+            if doppler_shift != 0:
+                baseband = baseband * np.exp(1j * 2 * np.pi * doppler_shift * t)
         
         elif modulation_type == 'qpsk':
             # QPSK调制信号
@@ -146,17 +157,21 @@ class SatelliteSignal:
             # 生成QPSK基带信号（I+jQ）
             baseband = i_baseband + 1j * q_baseband
             
+            # 添加多普勒频移（通过频率偏移实现）
+            if doppler_shift != 0:
+                baseband = baseband * np.exp(1j * 2 * np.pi * doppler_shift * t)
+        
         else:
             # 默认使用正弦波
-            baseband_freq = 100000  # 基带频率100kHz
+            baseband_freq = doppler_shift  # 基带频率等于多普勒频移
             baseband = np.cos(2 * np.pi * baseband_freq * t)
         
         # 调制信号
         # 如果baseband是复数（如QPSK），则使用IQ调制
         if np.iscomplexobj(baseband):
             # IQ调制
-            signal = np.real(baseband) * np.cos(2 * np.pi * (self.frequency + doppler_shift) * t) - \
-                     np.imag(baseband) * np.sin(2 * np.pi * (self.frequency + doppler_shift) * t)
+            signal = np.real(baseband) * np.cos(2 * np.pi * (self.frequency -self.freqlocal + doppler_shift) * t) - \
+                     np.imag(baseband) * np.sin(2 * np.pi * (self.frequency -self.freqlocal + doppler_shift) * t)
         else:
             # AM调制
             signal = carrier * baseband
@@ -164,9 +179,11 @@ class SatelliteSignal:
         # 计算信号功率
         signal_power = np.mean(np.abs(signal)**2)
         
-        # 生成噪声
+        # 生成噪声（复数噪声，I和Q路独立）
         noise_power = signal_power / (10**(snr_db/10))
-        noise = np.sqrt(noise_power) * np.random.randn(N)
+        noise_i = np.sqrt(noise_power/2) * np.random.randn(N)
+        noise_q = np.sqrt(noise_power/2) * np.random.randn(N)
+        noise = noise_i + 1j * noise_q
         
         # 添加噪声到信号
         noisy_signal = signal + noise
@@ -196,11 +213,8 @@ class SatelliteSignal:
         
         # 处理每个方向的信号
         for azimuth, elevation, doppler_shift in directions:
-            # 生成带有多普勒频移的信号
+            # 生成带有多普勒频移的信号（已经是复数基带信号）
             signal = self.generate_signal(duration, snr_db, doppler_shift)
-            
-            # 将实信号转换为复解析信号
-            analytic_signal = hilbert(signal)
             
             # 计算导向矢量（考虑阵列姿态）
             # 利用beamformer的calculate_steering_vector方法，该方法会考虑天线姿态
@@ -208,9 +222,9 @@ class SatelliteSignal:
             steering_vector = beamformer.calculate_steering_vector(azimuth, elevation, use_array_attitude=True)
             
             # 为每个阵元应用相位延迟并叠加信号
-            # 直接使用导向矢量，简化计算：analytic_signal * steering_vector[i] 等价于 analytic_signal * np.exp(-1j * phase_delay[i])
+            # 直接使用导向矢量，简化计算：signal * steering_vector[i] 等价于 signal * np.exp(-1j * phase_delay[i])
             for i in range(total_antennas):
-                received_signals[i, :] += analytic_signal * steering_vector[i]
+                received_signals[i, :] += signal * steering_vector[i]
         
         return received_signals
         
