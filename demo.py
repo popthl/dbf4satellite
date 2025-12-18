@@ -3,31 +3,111 @@ from antenna_array import AntennaArray2D
 from beamforming import Beamformer
 from satellite_signal import SatelliteSignal
 from visualization import Visualization
+from datetime import datetime
+import os
+
+def read_tle_file(file_path):
+    """
+    从文件中读取TLE数据
+    
+    参数:
+        file_path: TLE文件路径
+    
+    返回:
+        字典，键为卫星名称，值为包含line1和line2的字典
+    """
+    tle_dict = {}
+    
+    with open(file_path, 'r') as f:
+        lines = [line.strip() for line in f if line.strip()]
+    
+    for i in range(0, len(lines), 3):
+        if i + 2 < len(lines):
+            sat_name = lines[i]
+            line1 = lines[i+1]
+            line2 = lines[i+2]
+            tle_dict[sat_name] = {
+                'line1': line1,
+                'line2': line2
+            }
+    
+    return tle_dict
 
 def main():
     # 1. 初始化参数
     print("初始化2D多波束天线阵列...")
+    
+    # 使用真实北斗卫星频率（接近B1频段）
+    frequency = 1.5e9  # 1.5 GHz
+    freqlocal = 1.4985e9
     
     # 天线阵列参数
     num_antennas_x = 4
     num_antennas_y = 4
     spacing_x = 0.5  # 波长倍数
     spacing_y = 0.5  # 波长倍数
-    frequency = 1e6  # 1 MHz
     
     # 信号参数
     bandwidth = 10e6  # 10 MHz
-    sampling_rate = 20e6  # 20 MHz
-    duration = 0.001  # 0.1秒
+    sampling_rate = 40e6  # 40 MHz（基带信号采样，2倍过采样足够）
+    duration = 0.01  # 0.001秒（适当延长信号时长，提高信噪比）
     snr_db = 20  # 20 dB
     
-    # 定义三个不同方向，每个方向带不同的多普勒频移
-    # 格式：(方位角, 俯仰角, 多普勒频移)
-    directions_with_doppler = [
-        (30, 45, 10000),   # 方向1：方位角30度，俯仰角45度，多普勒频移1000Hz
-        (-20, 30, -5000),  # 方向2：方位角-20度，俯仰角30度，多普勒频移-500Hz
-        (60, 60, 20000)    # 方向3：方位角60度，俯仰角60度，多普勒频移2000Hz
-    ]
+    # 地面站位置（北京）
+    ground_lat = 39.9042
+    ground_lon = 116.4074
+    ground_alt = 0.0
+    
+    # 当前时间
+    current_time = datetime.now()
+    
+    # 北斗TLE文件路径
+    tle_file_path = "beidou.tle"
+    
+    # 从文件中读取TLE数据
+    if os.path.exists(tle_file_path):
+        print(f"从 {tle_file_path} 读取北斗卫星TLE数据...")
+        tle_data = read_tle_file(tle_file_path)
+        print(f"成功读取 {len(tle_data)} 颗北斗卫星的TLE数据")
+    else:
+        print(f"错误：{tle_file_path} 文件不存在")
+        exit(1)
+    
+    # 创建卫星信号生成器，用于计算卫星参数
+    signal_generator = SatelliteSignal(
+        frequency=frequency,
+        freqlocal=freqlocal,
+        bandwidth=bandwidth,
+        sampling_rate=sampling_rate
+    )
+    
+    # 计算可见卫星的方向和多普勒频移
+    print("计算可见卫星的方向和多普勒频移...")
+    directions_with_doppler = []
+    max_satellites = 3  # 最多使用3颗卫星
+    elevation_threshold = 5  # 仰角阈值5度
+    
+    for sat_name, tle in tle_data.items():
+        # 计算卫星信号参数
+        params = signal_generator.get_satellite_signal_parameters(
+            tle['line1'], tle['line2'],
+            ground_lat, ground_lon, ground_alt,
+            current_time,
+            elevation_threshold=elevation_threshold
+        )
+        
+        if params['can_receive']:
+            # 格式：(方位角, 俯仰角, 多普勒频移)
+            directions_with_doppler.append((params['azimuth'], params['elevation'], params['doppler_shift']))
+            print(f"{sat_name}: 方位角 {params['azimuth']:.2f}°, 仰角 {params['elevation']:.2f}°, 多普勒频移 {params['doppler_shift']:.2f} Hz")
+        
+        # 如果已经找到足够的卫星，就停止
+        if len(directions_with_doppler) >= max_satellites:
+            break
+    
+    if not directions_with_doppler:
+        print(f"没有找到仰角大于 {elevation_threshold}° 的可见卫星")
+        exit(1)
     
     # 2. 创建天线阵列
     antenna_array = AntennaArray2D(
@@ -41,13 +121,7 @@ def main():
     # 3. 创建波束形成器
     beamformer = Beamformer(antenna_array)
     
-    # 4. 创建卫星信号生成器
-    signal_generator = SatelliteSignal(
-        frequency=frequency,
-        bandwidth=bandwidth,
-        sampling_rate=sampling_rate
-    )
-    
+        
     # 5. 创建可视化对象
     viz = Visualization()
     
@@ -155,7 +229,44 @@ def main():
     multi_processed_signal = signal_generator.process_received_signal(received_signals, multi_weights)
     print(f"Multi-beam processed signal shape: {multi_processed_signal.shape}")
     
-    # 12. Plot received signal comparison
+    # 12. 计算所有可见卫星的位置，用于绘制天空图
+    print("\n计算所有可见卫星的位置...")
+    all_satellite_data = []
+    for sat_name, tle in tle_data.items():
+        # 计算卫星信号参数
+        params = signal_generator.get_satellite_signal_parameters(
+            tle['line1'], tle['line2'],
+            ground_lat, ground_lon, ground_alt,
+            current_time,
+            elevation_threshold=elevation_threshold
+        )
+        all_satellite_data.append({
+            'name': sat_name,
+            'azimuth': params['azimuth'],
+            'elevation': params['elevation'],
+            'doppler_shift': params['doppler_shift'],
+            'can_receive': params['can_receive']
+        })
+    
+    # 13. 绘制考虑天线姿态的天空图
+    print("\n绘制考虑天线姿态的天空图...")
+    
+    # 获取天线阵列的姿态参数
+    array_attitude = {
+        'azimuth': antenna_array.array_azimuth,
+        'elevation': antenna_array.array_elevation,
+        'roll': antenna_array.array_roll
+    }
+    
+    # 绘制天空图，考虑天线姿态
+    viz.plot_sky_plot(
+        all_satellite_data,
+        title=f'北斗卫星天空图（天线姿态：方位角{array_attitude["azimuth"]}°，俯仰角{array_attitude["elevation"]}°，滚转角{array_attitude["roll"]}°）',
+        max_labels=20,
+        array_attitude=array_attitude
+    )
+    
+    # 14. Plot received signal comparison
     print("\nPlotting received signal comparison...")
     
     # 获取单个阵元的信号（例如第一个阵元）
